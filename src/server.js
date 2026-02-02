@@ -1,12 +1,12 @@
 /**
- * Hono Server - Anthropic-compatible API
+ * Hono Server - Anthropic-compatible API & OpenAI-compatible API
  * Proxies to Google Cloud Code via Antigravity
  * Supports multi-account load balancing
  */
 
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { streamSSE } from 'hono/streaming';
+import { streamSSE, stream } from 'hono/streaming';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { sendMessage, sendMessageStream, listModels, getModelQuotas, getSubscriptionTier, isValidModel } from './cloudcode/index.js';
@@ -22,6 +22,7 @@ import { clearThinkingSignatureCache } from './format/signature-cache.js';
 import { formatDuration } from './utils/helpers.js';
 import { logger } from './utils/logger.js';
 import usageStats from './modules/usage-stats.js';
+import { convertOpenAIRequestToAnthropic, convertAnthropicResponseToOpenAI, convertAnthropicStreamToOpenAI } from './format/openai-converter.js';
 
 // Parse fallback flag directly from command line args to avoid circular dependency
 const args = process.argv.slice(2);
@@ -798,7 +799,6 @@ app.post('/v1/messages', async (c) => {
             const response = await sendMessage(request, accountManager, FALLBACK_ENABLED);
             return c.json(response);
         }
-
     } catch (error) {
         logger.error('[API] Error:', error);
 
@@ -828,6 +828,118 @@ app.post('/v1/messages', async (c) => {
         }, statusCode);
     }
 });
+
+/**
+ * OpenAI-compatible Chat Completions API
+ * POST /v1/chat/completions
+ */
+app.post('/v1/chat/completions', async (c) => {
+    try {
+        // Ensure account manager is initialized
+        await ensureInitialized();
+
+        const body = await c.req.json();
+
+        // Convert OpenAI request to Anthropic format
+        const anthropicReq = convertOpenAIRequestToAnthropic(body);
+
+        const {
+            stream: isStream,
+            model
+        } = anthropicReq;
+
+        // Resolve model mapping if configured
+        let requestedModel = model || 'claude-3-5-sonnet-20241022';
+        const modelMapping = config.modelMapping || {};
+        if (modelMapping[requestedModel] && modelMapping[requestedModel].mapping) {
+            const targetModel = modelMapping[requestedModel].mapping;
+            logger.info(`[Server] Mapping model ${requestedModel} -> ${targetModel}`);
+            requestedModel = targetModel;
+            anthropicReq.model = targetModel; // Update model in request
+        }
+
+        const modelId = requestedModel;
+
+        // Validate model ID before processing
+        // (Similar logic to /v1/messages)
+        const { account: validationAccount } = accountManager.selectAccount();
+        if (validationAccount) {
+            const token = await accountManager.getTokenForAccount(validationAccount);
+            const projectId = validationAccount.subscription?.projectId || null;
+            const valid = await isValidModel(modelId, token, projectId);
+
+            if (!valid) {
+                // OpenAI error format
+                return c.json({
+                    error: {
+                        message: `Invalid model: ${modelId}.`,
+                        type: 'invalid_request_error',
+                        param: 'model',
+                        code: 'model_not_found'
+                    }
+                }, 400);
+            }
+        }
+
+        // Optimistic Retry Check
+        if (accountManager.isAllRateLimited(modelId)) {
+            logger.warn(`[Server] All accounts rate-limited for ${modelId}. Resetting state for optimistic retry.`);
+            accountManager.resetAllRateLimits();
+        }
+
+        logger.info(`[API] OpenAI Chat Completion Request for model: ${anthropicReq.model}, stream: ${!!isStream}`);
+
+        if (isStream) {
+            // Handle streaming response using Hono stream helper
+            c.header('Content-Type', 'text/event-stream');
+            c.header('Cache-Control', 'no-cache');
+            c.header('Connection', 'keep-alive');
+
+            return stream(c, async (stream) => {
+                try {
+                    // Get Anthropic stream generator
+                    const anthropicStream = sendMessageStream(anthropicReq, accountManager, FALLBACK_ENABLED);
+
+                    // Convert and write OpenAI chunks
+                    for await (const chunk of convertAnthropicStreamToOpenAI(anthropicStream, modelId)) {
+                        await stream.write(chunk);
+                    }
+                } catch (streamError) {
+                    logger.error('[API] Stream error:', streamError);
+                    // Try to send error in stream if possible, or just close
+                    const { errorMessage } = parseError(streamError);
+                    const errorChunk = {
+                        error: {
+                            message: errorMessage,
+                            type: 'server_error',
+                            code: 'server_error'
+                        }
+                    };
+                    await stream.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+                }
+            });
+
+        } else {
+            // Handle non-streaming response
+            const response = await sendMessage(anthropicReq, accountManager, FALLBACK_ENABLED);
+            const openAIResponse = convertAnthropicResponseToOpenAI(response);
+            return c.json(openAIResponse);
+        }
+
+    } catch (error) {
+        logger.error('[API] Error processing OpenAI request:', error);
+        const { statusCode, errorMessage } = parseError(error);
+
+        return c.json({
+            error: {
+                message: errorMessage,
+                type: 'server_error', // Map properly if possible
+                code: statusCode
+            }
+        }, statusCode);
+    }
+});
+
 
 // Mount WebUI (optional web interface for account management)
 mountWebUI(app, __dirname, accountManager);

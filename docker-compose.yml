@@ -1,0 +1,11 @@
+services:
+  new-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: new-api
+    restart: always
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./antigravity-proxy:/root/.config/antigravity-proxy
