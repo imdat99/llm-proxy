@@ -932,9 +932,9 @@ export function mountWebUI(app, dirname, accountManager) {
             }
 
             // Determine redirect URL based on current server port
-            const port = process.env.PORT || DEFAULT_PORT;
-            const redirectUri = `http://localhost:${port}/oauth-callback`;
-
+            // const port = process.env.PORT || DEFAULT_PORT;
+            // const redirectUri = `http://localhost:${port}/oauth-callback`;
+            const redirectUri = new URL(c.req.url).origin + "/oauth-callback";
             // Generate OAuth URL with custom redirect URI
             const { url, verifier, state } = getAuthorizationUrl(redirectUri);
 
