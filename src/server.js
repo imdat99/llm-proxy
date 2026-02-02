@@ -658,6 +658,50 @@ app.get('/v1/models', async (c) => {
 });
 
 /**
+ * LiteLLM-compatible Model Info endpoint
+ * GET /v1/model/info
+ */
+app.get('/v1/model/info', async (c) => {
+    try {
+        await ensureInitialized();
+        const { account } = accountManager.selectAccount();
+        if (!account) {
+            return c.json({
+                type: 'error',
+                error: {
+                    type: 'api_error',
+                    message: 'No accounts available'
+                }
+            }, 503);
+        }
+        const token = await accountManager.getTokenForAccount(account);
+        const models = await listModels(token);
+
+        const data = models.data.map(model => ({
+            model_name: model.id,
+            litellm_params: {
+                model: model.id
+            },
+            model_info: {
+                id: model.id,
+                db_model: true
+            }
+        }));
+
+        return c.json({ data });
+    } catch (error) {
+        logger.error('[API] Error getting model info:', error);
+        return c.json({
+            type: 'error',
+            error: {
+                type: 'api_error',
+                message: error.message
+            }
+        }, 500);
+    }
+});
+
+/**
  * Count tokens endpoint - Anthropic Messages API compatible
  * Uses local tokenization with official tokenizers (@anthropic-ai/tokenizer for Claude, @lenml/tokenizer-gemini for Gemini)
  */
