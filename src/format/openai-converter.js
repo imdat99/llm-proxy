@@ -398,16 +398,24 @@ export async function* convertAnthropicStreamToOpenAI(anthropicStream, modelName
     const id = `chatcmpl-${crypto.randomUUID()}`;
     const timestamp = Math.floor(Date.now() / 1000);
 
+    let toolCallCount = 0;
+    const toolIndexMap = new Map(); // Maps Anthropic content_block index -> OpenAI tool_calls index
+
     // Send initial chunk
     yield createStreamChunk(id, timestamp, modelName, { role: 'assistant', content: '' }, null);
 
     for await (const event of anthropicStream) {
         if (event.type === 'content_block_start') {
             if (event.content_block.type === 'tool_use') {
+                // Determine the next sequential index for this tool call
+                const openAIToolIndex = toolCallCount;
+                toolIndexMap.set(event.index, openAIToolIndex);
+                toolCallCount++;
+
                 // Start a tool call
                 const toolCallChunk = {
                     tool_calls: [{
-                        index: event.index,
+                        index: openAIToolIndex,
                         id: event.content_block.id,
                         type: 'function',
                         function: {
@@ -420,27 +428,55 @@ export async function* convertAnthropicStreamToOpenAI(anthropicStream, modelName
             }
         } else if (event.type === 'content_block_delta') {
             if (event.delta.type === 'text_delta') {
-                yield createStreamChunk(id, timestamp, modelName, { content: event.delta.text }, null);
+                const text = event.delta.text || '';
+                yield createStreamChunk(id, timestamp, modelName, { content: text }, null);
             } else if (event.delta.type === 'input_json_delta') {
-                const toolCallChunk = {
-                    tool_calls: [{
-                        index: event.index,
-                        function: {
-                            arguments: event.delta.partial_json
-                        }
-                    }]
-                };
-                yield createStreamChunk(id, timestamp, modelName, toolCallChunk, null);
+                // Retrieve the mapped index
+                const openAIToolIndex = toolIndexMap.get(event.index);
+                if (openAIToolIndex !== undefined) {
+                    const toolCallChunk = {
+                        tool_calls: [{
+                            index: openAIToolIndex,
+                            function: {
+                                arguments: event.delta.partial_json
+                            }
+                        }]
+                    };
+                    yield createStreamChunk(id, timestamp, modelName, toolCallChunk, null);
+                }
             }
         } else if (event.type === 'message_stop') {
-            yield createStreamChunk(id, timestamp, modelName, {}, 'stop');
+            // Don't yield stop here, wait for message_delta to get full stop reason and usage
         } else if (event.type === 'message_delta') {
             // Updated usage, stop_reason, etc.
             if (event.delta && event.delta.stop_reason) {
                 let finish_reason = 'stop';
                 if (event.delta.stop_reason === 'tool_use') finish_reason = 'tool_calls';
                 if (event.delta.stop_reason === 'max_tokens') finish_reason = 'length';
-                yield createStreamChunk(id, timestamp, modelName, {}, finish_reason);
+
+                // Construct the final chunk manually to include top-level usage
+                // CRITICAL FIX: Ensure delta is not empty to prevent client "Cannot read properties of undefined (reading 'content')"
+                const finalChunk = {
+                    id: id,
+                    object: 'chat.completion.chunk',
+                    created: timestamp,
+                    model: modelName,
+                    choices: [{
+                        index: 0,
+                        delta: { content: '' },
+                        finish_reason: finish_reason
+                    }]
+                };
+
+                if (event.usage) {
+                    finalChunk.usage = {
+                        prompt_tokens: 0, // Anthropic doesn't always send total prompt tokens in delta
+                        completion_tokens: event.usage.output_tokens || 0,
+                        total_tokens: event.usage.output_tokens || 0
+                    };
+                }
+
+                yield `data: ${JSON.stringify(finalChunk)}\n\n`;
             }
         }
     }
