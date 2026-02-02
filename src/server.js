@@ -23,6 +23,14 @@ import { formatDuration } from './utils/helpers.js';
 import { logger } from './utils/logger.js';
 import usageStats from './modules/usage-stats.js';
 import { convertOpenAIRequestToAnthropic, convertAnthropicResponseToOpenAI, convertAnthropicStreamToOpenAI } from './format/openai-converter.js';
+import {
+    convertOllamaChatRequestToAnthropic,
+    convertOllamaGenerateRequestToAnthropic,
+    convertAnthropicResponseToOllamaChat,
+    convertAnthropicResponseToOllamaGenerate,
+    convertAnthropicStreamToOllamaChat,
+    convertAnthropicStreamToOllamaGenerate
+} from './format/ollama-converter.js';
 
 // Parse fallback flag directly from command line args to avoid circular dependency
 const args = process.argv.slice(2);
@@ -981,6 +989,151 @@ app.post('/v1/chat/completions', async (c) => {
                 code: statusCode
             }
         }, statusCode);
+    }
+});
+
+
+
+/**
+ * Ollama-compatible Tags API (List Models)
+ * GET /api/tags
+ */
+app.get('/api/tags', async (c) => {
+    try {
+        await ensureInitialized();
+        const { account } = accountManager.selectAccount();
+        if (!account) {
+            return c.json({ error: 'No accounts available' }, 503);
+        }
+        const token = await accountManager.getTokenForAccount(account);
+        const models = await listModels(token);
+
+        // Map to Ollama tags format
+        const tags = models.data.map(model => ({
+            name: model.id,
+            model: model.id,
+            modified_at: new Date().toISOString(),
+            size: 0,
+            digest: 'unknown',
+            details: {
+                parent_model: '',
+                format: 'gguf',
+                family: 'llama',
+                families: ['llama'],
+                parameter_size: '7B',
+                quantization_level: 'Q4_0'
+            }
+        }));
+
+        return c.json({ models: tags });
+    } catch (error) {
+        logger.error('[API] Error listing models for Ollama:', error);
+        return c.json({ error: error.message }, 500);
+    }
+});
+
+/**
+ * Ollama-compatible Chat API
+ * POST /api/chat
+ */
+app.post('/api/chat', async (c) => {
+    try {
+        await ensureInitialized();
+        const body = await c.req.json();
+        const anthropicReq = convertOllamaChatRequestToAnthropic(body);
+
+        // Resolve model mapping if configured
+        let requestedModel = anthropicReq.model || 'claude-3-5-sonnet-20241022';
+        const modelMapping = config.modelMapping || {};
+        if (modelMapping[requestedModel] && modelMapping[requestedModel].mapping) {
+            requestedModel = modelMapping[requestedModel].mapping;
+            anthropicReq.model = requestedModel;
+        }
+
+        // Optimistic Retry Check
+        if (accountManager.isAllRateLimited(requestedModel)) {
+            logger.warn(`[Server] All accounts rate-limited for ${requestedModel}. Resetting state for optimistic retry.`);
+            accountManager.resetAllRateLimits();
+        }
+
+        logger.info(`[API] Ollama Chat Request for model: ${anthropicReq.model}, stream: ${!!anthropicReq.stream}`);
+
+        if (anthropicReq.stream) {
+            c.header('Content-Type', 'application/x-ndjson');
+            return stream(c, async (stream) => {
+                try {
+                    const anthropicStream = sendMessageStream(anthropicReq, accountManager, FALLBACK_ENABLED);
+                    for await (const chunk of convertAnthropicStreamToOllamaChat(anthropicStream, requestedModel)) {
+                        await stream.write(chunk);
+                    }
+                } catch (error) {
+                    logger.error('[API] Stream error:', error);
+                    const { errorMessage } = parseError(error);
+                    await stream.write(JSON.stringify({ error: errorMessage, done: true }));
+                }
+            });
+        } else {
+            const response = await sendMessage(anthropicReq, accountManager, FALLBACK_ENABLED);
+            const ollamaResponse = convertAnthropicResponseToOllamaChat(response, requestedModel);
+            return c.json(ollamaResponse);
+        }
+
+    } catch (error) {
+        logger.error('[API] Error processing Ollama chat request:', error);
+        const { statusCode, errorMessage } = parseError(error);
+        return c.json({ error: errorMessage }, statusCode);
+    }
+});
+
+/**
+ * Ollama-compatible Generate API
+ * POST /api/generate
+ */
+app.post('/api/generate', async (c) => {
+    try {
+        await ensureInitialized();
+        const body = await c.req.json();
+        const anthropicReq = convertOllamaGenerateRequestToAnthropic(body);
+
+        // Resolve model mapping
+        let requestedModel = anthropicReq.model || 'claude-3-5-sonnet-20241022';
+        const modelMapping = config.modelMapping || {};
+        if (modelMapping[requestedModel] && modelMapping[requestedModel].mapping) {
+            requestedModel = modelMapping[requestedModel].mapping;
+            anthropicReq.model = requestedModel;
+        }
+
+        // Optimistic Retry Check
+        if (accountManager.isAllRateLimited(requestedModel)) {
+            logger.warn(`[Server] All accounts rate-limited for ${requestedModel}. Resetting state for optimistic retry.`);
+            accountManager.resetAllRateLimits();
+        }
+
+        logger.info(`[API] Ollama Generate Request for model: ${anthropicReq.model}, stream: ${!!anthropicReq.stream}`);
+
+        if (anthropicReq.stream) {
+            c.header('Content-Type', 'application/x-ndjson');
+            return stream(c, async (stream) => {
+                try {
+                    const anthropicStream = sendMessageStream(anthropicReq, accountManager, FALLBACK_ENABLED);
+                    for await (const chunk of convertAnthropicStreamToOllamaGenerate(anthropicStream, requestedModel)) {
+                        await stream.write(chunk);
+                    }
+                } catch (error) {
+                    logger.error('[API] Stream error:', error);
+                    const { errorMessage } = parseError(error);
+                    await stream.write(JSON.stringify({ error: errorMessage, done: true }));
+                }
+            });
+        } else {
+            const response = await sendMessage(anthropicReq, accountManager, FALLBACK_ENABLED);
+            const ollamaResponse = convertAnthropicResponseToOllamaGenerate(response, requestedModel);
+            return c.json(ollamaResponse);
+        }
+    } catch (error) {
+        logger.error('[API] Error processing Ollama generate request:', error);
+        const { statusCode, errorMessage } = parseError(error);
+        return c.json({ error: errorMessage }, statusCode);
     }
 });
 
