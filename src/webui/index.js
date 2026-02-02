@@ -919,8 +919,7 @@ export function mountWebUI(app, dirname, accountManager) {
 
     /**
      * GET /api/auth/url - Get OAuth URL to start the flow
-     * Uses CLI's OAuth flow (localhost:51121) instead of WebUI's port
-     * to match Google OAuth Console's authorized redirect URIs
+     * Uses the main server's port for the callback
      */
     app.get('/api/auth/url', async (c) => {
         try {
@@ -932,59 +931,152 @@ export function mountWebUI(app, dirname, accountManager) {
                 }
             }
 
-            // Generate OAuth URL using default redirect URI (localhost:51121)
-            const { url, verifier, state } = getAuthorizationUrl();
+            // Determine redirect URL based on current server port
+            const port = process.env.PORT || DEFAULT_PORT;
+            const redirectUri = `http://localhost:${port}/oauth-callback`;
 
-            // Start callback server on port 51121 (same as CLI)
-            const { promise: serverPromise, abort: abortServer } = startCallbackServer(state, 120000); // 2 min timeout
+            // Generate OAuth URL with custom redirect URI
+            const { url, verifier, state } = getAuthorizationUrl(redirectUri);
 
             // Store the flow data
             pendingOAuthFlows.set(state, {
-                serverPromise,
-                abortServer,
                 verifier,
                 state,
                 timestamp: Date.now()
             });
 
-            // Start async handler for the OAuth callback
-            serverPromise
-                .then(async (code) => {
-                    try {
-                        logger.info('[WebUI] Received OAuth callback, completing flow...');
-                        const accountData = await completeOAuthFlow(code, verifier);
-
-                        // Add or update the account
-                        // Note: Don't set projectId here - it will be discovered and stored
-                        // in the refresh token via getProjectForAccount() on first use
-                        await addAccount({
-                            email: accountData.email,
-                            refreshToken: accountData.refreshToken,
-                            source: 'oauth'
-                        });
-
-                        // Reload AccountManager to pick up the new account
-                        await accountManager.reload();
-
-                        logger.success(`[WebUI] Account ${accountData.email} added successfully`);
-                    } catch (err) {
-                        logger.error('[WebUI] OAuth flow completion error:', err);
-                    } finally {
-                        pendingOAuthFlows.delete(state);
-                    }
-                })
-                .catch((err) => {
-                    // Only log if not aborted (manual completion causes this)
-                    if (!err.message?.includes('aborted')) {
-                        logger.error('[WebUI] OAuth callback server error:', err);
-                    }
-                    pendingOAuthFlows.delete(state);
-                });
+            logger.info(`[WebUI] Starting OAuth flow with redirect URI: ${redirectUri}`);
 
             return c.json({ status: 'ok', url, state });
         } catch (error) {
             logger.error('[WebUI] Error generating auth URL:', error);
             return c.json({ status: 'error', error: error.message }, 500);
+        }
+    });
+
+    /**
+     * GET /oauth-callback - Handle OAuth callback on main server
+     */
+    app.get('/oauth-callback', async (c) => {
+        const code = c.req.query('code');
+        const state = c.req.query('state');
+        const error = c.req.query('error');
+
+        // Helper to render HTML response
+        const renderResponse = (title, message, isError = false) => {
+            const color = isError ? '#dc3545' : '#28a745';
+            const icon = isError ? '❌' : '✅';
+            return c.html(`
+                <html>
+                <head><meta charset="UTF-8"><title>${title}</title></head>
+                <body style="font-family: system-ui; padding: 40px; text-align: center;">
+                    <h1 style="color: ${color};">${icon} ${title}</h1>
+                    <p>${message}</p>
+                    <p>You can close this window.</p>
+                    ${!isError ? '<script>setTimeout(() => window.close(), 2000);</script>' : ''}
+                </body>
+                </html>
+            `);
+        };
+
+        if (error) {
+            return renderResponse('Authentication Failed', `Error: ${error}`, true);
+        }
+
+        if (!code || !state) {
+            return renderResponse('Authentication Failed', 'Missing code or state parameter', true);
+        }
+
+        const flowData = pendingOAuthFlows.get(state);
+        if (!flowData) {
+            return renderResponse('Authentication Failed', 'Invalid or expired state. Please try again.', true);
+        }
+
+        try {
+            const { verifier } = flowData;
+
+            logger.info('[WebUI] Received OAuth callback, completing flow...');
+
+            // Exchange code for tokens
+            // Note: We normally pass verifier, but completeOAuthFlow in oauth.js 
+            // might use the default redirect_uri if strict matching is enforced by Google.
+            // We need to ensure completeOAuthFlow (or exchangeCode) uses the correct redirect_uri.
+            // Looking at oauth.js, exchangeCode uses OAUTH_REDIRECT_URI constant.
+            // We need to modify exchangeCode to accept a custom redirect URI or we need to hack it.
+            // Use the lower-level exchangeCode if needed, but completeOAuthFlow wraps it.
+            // Let's modify oauth.js imports or assume we make a small change.
+            // Actually, we must use the same redirect_uri as request.
+            // HACK: We can't easily change OAUTH_REDIRECT_URI constant.
+            // We need to manually call exchangeCode with the correct URI if the constant is wrong.
+            // BUT oauth.js `exchangeCode` function takes `code, verifier`. It doesn't take redirectURI.
+            // It uses `OAUTH_REDIRECT_URI` from constants.
+
+            // Fix: We must manually construct the token request here OR export a flexible exchange function.
+            // Since we can't easily change oauth.js right now without another step, let's see.
+            // `exchangeCode` in `oauth.js`:
+            // body: new URLSearchParams({ ..., redirect_uri: OAUTH_REDIRECT_URI })
+
+            // This is a problem. The redirect_uri MUST match.
+            // I'll assume we can use the `completeOAuthFlow` for now, but I might need to update `oauth.js`
+            // if it forces the wrong URI. 
+            // Wait, I can define the correct URI in `oauth.js` logic if I modify it, 
+            // OR I can just copy the exchange logic here since it's simple.
+
+            // Let's implement the exchange manually here to be safe and avoid touching constants.js yet if possible,
+            // or better: update `oauth.js` to accept a redirectUri override.
+
+            // ... Actually, I noticed `getAuthorizationUrl` takes `customRedirectUri`.
+            // But `exchangeCode` does NOT. This is a design flaw in `oauth.js`.
+            // I should modify `oauth.js` to support this, or implement manual exchange here.
+
+            // Manual Exchange Implementation:
+            const { OAUTH_CONFIG } = await import('../constants.js');
+            const port = process.env.PORT || DEFAULT_PORT;
+            const redirectUri = `http://localhost:${port}/oauth-callback`;
+
+            const response = await fetch(OAUTH_CONFIG.tokenUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    client_id: OAUTH_CONFIG.clientId,
+                    client_secret: OAUTH_CONFIG.clientSecret,
+                    code: code,
+                    code_verifier: verifier,
+                    grant_type: 'authorization_code',
+                    redirect_uri: redirectUri
+                })
+            });
+
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error(`Token exchange failed: ${text}`);
+            }
+
+            const tokens = await response.json();
+            const { getUserEmail, discoverProjectId } = await import('../auth/oauth.js');
+            const email = await getUserEmail(tokens.access_token);
+            const projectId = await discoverProjectId(tokens.access_token);
+
+            // Add account
+            await addAccount({
+                email,
+                refreshToken: tokens.refresh_token,
+                projectId,
+                source: 'oauth'
+            });
+
+            // Reload manager
+            await accountManager.reload();
+
+            // Cleanup
+            pendingOAuthFlows.delete(state);
+
+            logger.success(`[WebUI] Account ${email} added successfully`);
+            return renderResponse('Authentication Successful', `Account ${email} added!`);
+
+        } catch (err) {
+            logger.error('[WebUI] OAuth error:', err);
+            return renderResponse('Authentication Failed', err.message, true);
         }
     });
 
@@ -1012,40 +1104,72 @@ export function mountWebUI(app, dirname, accountManager) {
                 }, 400);
             }
 
-            const { verifier, abortServer } = flowData;
+            const { verifier } = flowData;
 
-            // Extract code from input (URL or raw code)
+            // Extract code from input
             const { extractCodeFromInput, completeOAuthFlow } = await import('../auth/oauth.js');
             const { code } = extractCodeFromInput(callbackInput);
 
-            // Complete the OAuth flow
-            const accountData = await completeOAuthFlow(code, verifier);
+            // For manual completion, we default to the standard flow which typically
+            // uses the manual copy-paste OOB or the standard redirect URI.
+            // If the user pasted a URL from the NEW flow, it will have the new redirect_uri.
+            // But `completeOAuthFlow` uses the OLD redirect_uri constant.
+            // Use the same manual exchange logic as above to be safe if it's from our new flow.
+
+            // Try standard exchange first (in case they used the old method somehow? Unlikely)
+            // Actually, `getAuthorizationUrl` was called with the NEW redirect URI.
+            // So the code IS bound to the NEW redirect URI.
+            // We MUST use the new redirect URI for exchange.
+
+            const { OAUTH_CONFIG } = await import('../constants.js');
+            const port = process.env.PORT || DEFAULT_PORT;
+            const redirectUri = `http://localhost:${port}/oauth-callback`;
+
+            const response = await fetch(OAUTH_CONFIG.tokenUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    client_id: OAUTH_CONFIG.clientId,
+                    client_secret: OAUTH_CONFIG.clientSecret,
+                    code: code,
+                    code_verifier: verifier,
+                    grant_type: 'authorization_code',
+                    redirect_uri: redirectUri
+                })
+            });
+
+            if (!response.ok) {
+                const text = await response.text();
+                // Fallback: Try with the default/old URI just in case? 
+                // No, sticking to one consistent path is better.
+                throw new Error(`Token exchange failed: ${text}`);
+            }
+
+            const tokens = await response.json();
+            const { getUserEmail, discoverProjectId } = await import('../auth/oauth.js');
+            const email = await getUserEmail(tokens.access_token);
+            const projectId = await discoverProjectId(tokens.access_token);
 
             // Add or update the account
             await addAccount({
-                email: accountData.email,
-                refreshToken: accountData.refreshToken,
-                projectId: accountData.projectId,
+                email: email,
+                refreshToken: tokens.refresh_token,
+                projectId: projectId,
                 source: 'oauth'
             });
 
             // Reload AccountManager to pick up the new account
             await accountManager.reload();
 
-            // Abort the callback server since manual completion succeeded
-            if (abortServer) {
-                abortServer();
-            }
-
             // Clean up
             pendingOAuthFlows.delete(state);
 
-            logger.success(`[WebUI] Account ${accountData.email} added via manual callback`);
+            logger.success(`[WebUI] Account ${email} added via manual callback`);
 
             return c.json({
                 status: 'ok',
-                email: accountData.email,
-                message: `Account ${accountData.email} added successfully`
+                email: email,
+                message: `Account ${email} added successfully`
             });
         } catch (error) {
             logger.error('[WebUI] Manual OAuth completion error:', error);

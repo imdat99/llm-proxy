@@ -69,38 +69,34 @@ document.addEventListener('alpine:init', () => {
             // Handle responsive sidebar transitions
             let lastWidth = window.innerWidth;
             let resizeTimeout = null;
-            
+
             window.addEventListener('resize', () => {
                 if (resizeTimeout) clearTimeout(resizeTimeout);
-                
+
                 resizeTimeout = setTimeout(() => {
                     const currentWidth = window.innerWidth;
                     const lgBreakpoint = 1024;
-                    
+
                     // Desktop -> Mobile: Auto-close sidebar to prevent overlay blocking screen
                     if (lastWidth >= lgBreakpoint && currentWidth < lgBreakpoint) {
                         this.sidebarOpen = false;
                     }
-                    
+
                     // Mobile -> Desktop: Auto-open sidebar (restore standard desktop layout)
                     if (lastWidth < lgBreakpoint && currentWidth >= lgBreakpoint) {
                         this.sidebarOpen = true;
                     }
-                    
+
                     lastWidth = currentWidth;
                 }, 150);
             });
 
             // Theme setup
-            document.documentElement.setAttribute('data-theme', 'black');
-            document.documentElement.classList.add('dark');
+            this.theme = localStorage.getItem('theme') || 'dark';
+            this.applyTheme();
 
             // Chart Defaults
-            if (typeof Chart !== 'undefined') {
-                Chart.defaults.color = window.utils.getThemeColor('--color-text-dim');
-                Chart.defaults.borderColor = window.utils.getThemeColor('--color-space-border');
-                Chart.defaults.font.family = '"JetBrains Mono", monospace';
-            }
+            this.updateChartDefaults();
 
             // Start Data Polling
             this.startAutoRefresh();
@@ -108,6 +104,47 @@ document.addEventListener('alpine:init', () => {
 
             // Initial Fetch
             Alpine.store('data').fetchData();
+        },
+
+        toggleTheme() {
+            this.theme = this.theme === 'light' ? 'dark' : 'light';
+            localStorage.setItem('theme', this.theme);
+            this.applyTheme();
+        },
+
+        applyTheme() {
+            const isDark = this.theme === 'dark';
+
+            // Update DOM
+            document.documentElement.setAttribute('data-theme', this.theme);
+            if (isDark) {
+                document.documentElement.classList.add('dark');
+            } else {
+                document.documentElement.classList.remove('dark');
+            }
+
+            // Update Charts
+            this.updateChartDefaults();
+
+            // Dispatch event for other components
+            window.dispatchEvent(new CustomEvent('theme-changed', {
+                detail: { theme: this.theme }
+            }));
+        },
+
+        updateChartDefaults() {
+            if (typeof Chart !== 'undefined') {
+                const isDark = this.theme === 'dark';
+                // Colors suitable for respective themes
+                const textColor = isDark && window.utils ? window.utils.getThemeColor('--color-text-dim') : '#6b7280';
+                const gridColor = isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)';
+                const borderColor = isDark && window.utils ? window.utils.getThemeColor('--color-space-border') : '#e5e7eb';
+
+                Chart.defaults.color = textColor;
+                Chart.defaults.scale.grid.color = gridColor;
+                Chart.defaults.borderColor = borderColor;
+                Chart.defaults.font.family = '"JetBrains Mono", monospace';
+            }
         },
 
         refreshTimer: null,

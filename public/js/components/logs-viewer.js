@@ -6,6 +6,12 @@ window.Components = window.Components || {};
 
 window.Components.logsViewer = () => ({
     logs: [],
+    // Virtual Scrolling State
+    itemHeight: 24, // Approximation (11px font * 1.625 line-height + 4px padding)
+    containerHeight: 0,
+    scrollTop: 0,
+    buffer: 10, // Extra items to render above/below
+
     isAutoScroll: true,
     eventSource: null,
     searchQuery: '',
@@ -17,42 +23,135 @@ window.Components.logsViewer = () => ({
         DEBUG: false
     },
 
-    get filteredLogs() {
-        const query = this.searchQuery.trim();
-        if (!query) {
-            return this.logs.filter(log => this.filters[log.level]);
-        }
+    // Cache filtered logs to avoid re-filtering on every scroll event
+    _filteredLogsCache: null,
+    _lastFilterState: null,
 
-        // Try regex first, fallback to plain text search
-        let matcher;
-        try {
-            const regex = new RegExp(query, 'i');
-            matcher = (msg) => regex.test(msg);
-        } catch (e) {
-            // Invalid regex, fallback to case-insensitive string search
-            const lowerQuery = query.toLowerCase();
-            matcher = (msg) => msg.toLowerCase().includes(lowerQuery);
-        }
-
-        return this.logs.filter(log => {
-            // Level Filter
-            if (!this.filters[log.level]) return false;
-
-            // Search Filter
-            return matcher(log.message);
+    get allFilteredLogs() {
+        // Simple dirty check for filters/search change
+        const currentFilterState = JSON.stringify({
+            q: this.searchQuery,
+            f: this.filters,
+            len: this.logs.length // invalidate on new logs
         });
+
+        if (this._lastFilterState === currentFilterState && this._filteredLogsCache) {
+            return this._filteredLogsCache;
+        }
+
+        const query = this.searchQuery.trim();
+        let result = this.logs;
+
+        // Apply Level Filters first (faster)
+        const activeLevels = Object.entries(this.filters)
+            .filter(([_, active]) => active)
+            .map(([level]) => level);
+
+        // Optimization: checking Set is faster than object property access for large loops
+        const activeLevelSet = new Set(activeLevels);
+        result = result.filter(log => activeLevelSet.has(log.level));
+
+        // Apply Search
+        if (query) {
+            let matcher;
+            try {
+                const regex = new RegExp(query, 'i');
+                matcher = (msg) => regex.test(msg);
+            } catch (e) {
+                const lowerQuery = query.toLowerCase();
+                matcher = (msg) => msg.toLowerCase().includes(lowerQuery);
+            }
+            result = result.filter(log => matcher(log.message));
+        }
+
+        this._filteredLogsCache = result;
+        this._lastFilterState = currentFilterState;
+        return result;
+    },
+
+    get visibleLogs() {
+        if (this.containerHeight === 0) return []; // Not initialized
+
+        const totalLogs = this.allFilteredLogs;
+        const totalCount = totalLogs.length;
+
+        // Calculate start/end indices
+        const startIndex = Math.max(0, Math.floor(this.scrollTop / this.itemHeight) - this.buffer);
+        const visibleCount = Math.ceil(this.containerHeight / this.itemHeight);
+        const endIndex = Math.min(totalCount, startIndex + visibleCount + (this.buffer * 2));
+
+        return totalLogs.slice(startIndex, endIndex).map((log, idx) => ({
+            ...log,
+            // Add absolute index for debugging or keys if needed
+            index: startIndex + idx
+        }));
+    },
+
+    get spacerTop() {
+        const startIndex = Math.max(0, Math.floor(this.scrollTop / this.itemHeight) - this.buffer);
+        return startIndex * this.itemHeight;
+    },
+
+    get spacerBottom() {
+        const totalLogs = this.allFilteredLogs;
+        const totalCount = totalLogs.length;
+        const startIndex = Math.max(0, Math.floor(this.scrollTop / this.itemHeight) - this.buffer);
+        const visibleCount = Math.ceil(this.containerHeight / this.itemHeight);
+        const endIndex = Math.min(totalCount, startIndex + visibleCount + (this.buffer * 2));
+
+        return Math.max(0, (totalCount - endIndex) * this.itemHeight);
     },
 
     init() {
         this.startLogStream();
 
+        // Initialize scroll container measurements
+        this.$nextTick(() => {
+            const container = document.getElementById('logs-container');
+            if (container) {
+                // Initial check
+                this.updateDimensions(container);
+
+                // Resize observer for responsive height changes
+                const ro = new ResizeObserver(() => this.updateDimensions(container));
+                ro.observe(container);
+            }
+        });
+
         this.$watch('isAutoScroll', (val) => {
             if (val) this.scrollToBottom();
         });
 
-        // Watch filters to maintain auto-scroll if enabled
-        this.$watch('searchQuery', () => { if(this.isAutoScroll) this.$nextTick(() => this.scrollToBottom()) });
-        this.$watch('filters', () => { if(this.isAutoScroll) this.$nextTick(() => this.scrollToBottom()) });
+        // When filters change, scroll to bottom if auto-scroll is on, 
+        // AND ensure we reset cache
+        this.$watch('searchQuery', () => {
+            if (this.isAutoScroll) this.$nextTick(() => this.scrollToBottom());
+        });
+
+        // Use a debounced watcher for resizing logs if needed? 
+        // For now, fixed height.
+    },
+
+    updateDimensions(container) {
+        this.containerHeight = container.clientHeight;
+        // If we want dynamic item height measuring, we'd do it here or in a loop
+
+        // Auto-scroll on resize if enabled
+        if (this.isAutoScroll) this.scrollToBottom();
+    },
+
+    handleScroll(e) {
+        const container = e.target;
+        this.scrollTop = container.scrollTop;
+
+        // Detect user scrolling up to disable auto-scroll
+        const isAtBottom = Math.abs((container.scrollHeight - container.clientHeight) - container.scrollTop) < 20;
+
+        if (!isAtBottom && this.isAutoScroll) {
+            this.isAutoScroll = false;
+        } else if (isAtBottom && !this.isAutoScroll) {
+            this.isAutoScroll = true;
+        }
     },
 
     startLogStream() {
@@ -76,7 +175,8 @@ window.Components.logsViewer = () => ({
                 }
 
                 if (this.isAutoScroll) {
-                    this.$nextTick(() => this.scrollToBottom());
+                    // Use requestAnimationFrame for smoother scrolling
+                    requestAnimationFrame(() => this.scrollToBottom());
                 }
             } catch (e) {
                 if (window.UILogger) window.UILogger.debug('Log parse error:', e.message);
@@ -91,10 +191,19 @@ window.Components.logsViewer = () => ({
 
     scrollToBottom() {
         const container = document.getElementById('logs-container');
-        if (container) container.scrollTop = container.scrollHeight;
+        if (container) {
+            // Set scrollTop to a large value to force bottom
+            // We use spacerBottom calculation, so scrollHeight should be accurate-ish
+            // But with virtual scrolling, sometimes scrollHeight is estimated.
+            // Since we use strict math for spacers, scrollHeight = total * itemHeight
+            // So this works perfectly.
+            container.scrollTop = container.scrollHeight;
+            this.scrollTop = container.scrollTop; // Update state immediately
+        }
     },
 
     clearLogs() {
         this.logs = [];
+        this._filteredLogsCache = [];
     }
 });

@@ -9,7 +9,16 @@
   --color-space-850: #121214;
   --color-space-800: #18181b;
   --color-space-border: #27272a;
-
+  
+  --color-space-950: #ffffff;
+    --color-space-900: #f3f4f6;
+    --color-space-850: #e5e7eb;
+    --color-space-800: #f9fafb;
+    --color-space-border: #d1d5db;
+    --color-text-primary: #111827;
+    --color-text-secondary: #374151;
+    --color-text-tertiary: #6b7280;
+    --color-text-quaternary: #9ca3af;
   /* === Neon Accents (Full Saturation) === */
   --color-neon-purple: #a855f7;
   --color-neon-green: #22c55e;
@@ -57,7 +66,17 @@
   --color-chart-15: #f97316;
   --color-chart-16: #6366f1;
 }
-
+[data-theme="light"] {
+    --color-space-950: #ffffff;
+    --color-space-900: #f3f4f6;
+    --color-space-850: #e5e7eb;
+    --color-space-800: #f9fafb;
+    --color-space-border: #d1d5db;
+    --color-text-primary: #111827;
+    --color-text-secondary: #374151;
+    --color-text-tertiary: #6b7280;
+    --color-text-quaternary: #9ca3af;
+}
 [x-cloak] {
   display: none !important;
 }
